@@ -23,11 +23,11 @@ struct HttpServer {
     remote: SocketAddr,
 }
 
-/// Copied from https://github.com/snapview/tungstenite-rs/blob/c16778797b2eeb118aa064aa5b483f90c3989627/src/handshake/mod.rs#L112C1-L125C1
 /// Derive the `Sec-WebSocket-Accept` response header from a `Sec-WebSocket-Key` request header.
 ///
-/// This function can be used to perform a handshake before passing a raw TCP stream to
-/// [`WebSocket::from_raw_socket`][crate::protocol::WebSocket::from_raw_socket].
+/// This example completes the handshake itself so it can hand the upgraded stream to
+/// [`LocalRelay::take_connection`], which is the entry point for servers that already
+/// speak HTTP.
 pub fn derive_accept_key(request_key: &[u8]) -> String {
     // ... field is constructed by concatenating /key/ ...
     // ... with the string "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" (RFC 6455)
