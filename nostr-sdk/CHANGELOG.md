@@ -29,6 +29,25 @@
 
 ## Unreleased
 
+### Breaking changes
+
+- Replace `async-wsocket` with `yawc` as the WebSocket implementation. The transport
+  sink and stream now carry `yawc::frame::Frame` instead of `async_wsocket::Message`,
+  so custom `WebSocketTransport` implementations build frames with `Frame::text` and
+  match incoming ones on `Frame::opcode`
+- Remove the `native-tls`, `native-tls-vendored` and `rustls-tls-native-roots`
+  features, which have no equivalent in `yawc`. `ring` and `aws_lc_rs` now select
+  yawc's rustls backends, and `rustls-tls-webpki-roots` is kept as a no-op because
+  yawc always trusts the webpki roots. The same features are removed from `nwc` and
+  `nostr-connect`
+
+### Changed
+
+- Route proxied relay connections through `socks5h`, leaving name resolution to the
+  proxy so `.onion` addresses stay reachable
+- Serve the local relay's listener over hyper, which is how yawc reaches its server
+  side. `LocalRelay::take_connection` is unchanged
+
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
