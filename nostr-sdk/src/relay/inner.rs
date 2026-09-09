@@ -1,13 +1,12 @@
 use std::borrow::Cow;
-use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
+use std::{cmp, str};
 
 use async_utility::{task, time};
-use async_wsocket::Message;
 use futures::{self, SinkExt, StreamExt};
 use nostr::filter::MatchEventOptions;
 use nostr::message::MachineReadablePrefix;
@@ -21,6 +20,7 @@ use rand::rngs::SysRng;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockWriteGuard, broadcast, oneshot, watch};
 use universal_time::Instant;
+use yawc::frame::{Frame, OpCode};
 
 use super::capabilities::{AtomicRelayCapabilities, RelayCapabilities};
 use super::constants::{
@@ -884,7 +884,7 @@ impl InnerRelay {
                     tracing::debug!("Sending '{json}' to '{}' (size: {size} bytes)", self.url);
 
                     // Compose WebSocket text messages
-                    let msg: Message = Message::Text(json);
+                    let msg: Frame = Frame::text(json);
 
                     // Send WebSocket messages
                     send_ws_msg(ws_tx, msg).await?;
@@ -916,7 +916,7 @@ impl InnerRelay {
                         ping.set_replied(false);
 
                         // Compose ping message
-                        let msg = Message::Ping(nonce.to_be_bytes().to_vec());
+                        let msg = Frame::ping(nonce.to_be_bytes().to_vec());
 
                         // Send WebSocket message
                         send_ws_msg(ws_tx, msg).await?;
@@ -944,47 +944,54 @@ impl InnerRelay {
         #[cfg(target_arch = "wasm32")]
         let _ping = ping;
 
-        while let Some(msg) = ws_rx.next().await {
-            match msg? {
-                Message::Text(json) => self.handle_relay_message(&json, &ingester_tx).await,
-                Message::Binary(_) => {
+        while let Some(frame) = ws_rx.next().await {
+            let frame: Frame = frame?;
+
+            match frame.opcode() {
+                // The transport asks yawc to validate UTF-8, so an invalid payload closes the
+                // connection before it reaches here. Handle it anyway rather than panicking on
+                // `Frame::as_str`.
+                OpCode::Text => match str::from_utf8(frame.payload()) {
+                    Ok(json) => self.handle_relay_message(json, &ingester_tx).await,
+                    Err(..) => {
+                        return Err(Error::protocol_msg("relay message is not valid UTF-8"));
+                    }
+                },
+                OpCode::Binary => {
                     tracing::warn!(url = %self.url, "Binary messages aren't supported.");
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                Message::Pong(bytes) if self.opts.ping && self.state.transport.support_ping() => {
-                    match bytes.try_into() {
-                        Ok(nonce) => {
-                            // Nonce from big-endian bytes
-                            let nonce: u64 = u64::from_be_bytes(nonce);
+                OpCode::Pong if self.opts.ping && self.state.transport.support_ping() => {
+                    let Ok(nonce) = <[u8; 8]>::try_from(frame.payload().as_ref()) else {
+                        return Err(Error::protocol_msg("can't parse pong"));
+                    };
 
-                            // Get last nonce
-                            let last_nonce: u64 = ping.last_nonce();
+                    // Nonce from big-endian bytes
+                    let nonce: u64 = u64::from_be_bytes(nonce);
 
-                            // Check if last nonce not matches the received one
-                            if last_nonce != nonce {
-                                return Err(Error::pong_not_match(last_nonce, nonce));
-                            }
+                    // Get last nonce
+                    let last_nonce: u64 = ping.last_nonce();
 
-                            // Set ping as replied
-                            ping.set_replied(true);
-
-                            // Save latency
-                            let sent_at = ping.sent_at().await;
-                            self.stats.save_latency(sent_at.elapsed());
-                        }
-                        Err(..) => {
-                            return Err(Error::protocol_msg("can't parse pong"));
-                        }
+                    // Check if last nonce not matches the received one
+                    if last_nonce != nonce {
+                        return Err(Error::pong_not_match(last_nonce, nonce));
                     }
+
+                    // Set ping as replied
+                    ping.set_replied(true);
+
+                    // Save latency
+                    let sent_at = ping.sent_at().await;
+                    self.stats.save_latency(sent_at.elapsed());
                 }
                 #[cfg(not(target_arch = "wasm32"))]
-                Message::Close(None) => break,
-                #[cfg(not(target_arch = "wasm32"))]
-                Message::Close(Some(frame)) => {
-                    tracing::info!(code = %frame.code, reason = %frame.reason, "Connection closed by peer.");
+                OpCode::Close => {
+                    if let Some(code) = frame.close_code() {
+                        let reason: &str = frame.close_reason().ok().flatten().unwrap_or_default();
+                        tracing::info!(?code, reason, "Connection closed by peer.");
+                    }
                     break;
                 }
-                #[cfg(not(target_arch = "wasm32"))]
                 _ => {}
             }
         }
@@ -1857,7 +1864,7 @@ impl InnerRelay {
 }
 
 /// Send a WebSocket message with timeout set to [WEBSOCKET_TX_TIMEOUT].
-async fn send_ws_msg(tx: &mut WebSocketSink, msg: Message) -> Result<(), Error> {
+async fn send_ws_msg(tx: &mut WebSocketSink, msg: Frame) -> Result<(), Error> {
     match time::timeout(Some(WEBSOCKET_TX_TIMEOUT), tx.send(msg)).await {
         Some(res) => Ok(res?),
         None => Err(Error::timeout()),

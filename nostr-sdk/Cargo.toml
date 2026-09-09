@@ -17,17 +17,16 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["ring", "rustls-tls-webpki-roots"]
-aws_lc_rs = ["async-wsocket/aws_lc_rs"]
-native-tls = ["async-wsocket/native-tls"]
-native-tls-vendored = ["async-wsocket/native-tls-vendored"]
-ring = ["async-wsocket/ring"]
-rustls-tls-native-roots = ["async-wsocket/rustls-tls-native-roots"]
-rustls-tls-webpki-roots = ["async-wsocket/rustls-tls-webpki-roots"]
+aws_lc_rs = ["yawc/rustls-aws-lc-rs"]
+ring = ["yawc/rustls-ring"]
+# Kept for compatibility: yawc always trusts the webpki roots, so this selects nothing.
+rustls-tls-webpki-roots = []
 local-relay = ["dep:nostr-memory", "tokio/net"]
 
 [dependencies]
 async-utility.workspace = true
-async-wsocket = { version = "0.17", features = ["socks"] }
+# TODO: only the local relay's server side still needs this, drop it once that moves to yawc.
+async-wsocket = { version = "0.17", default-features = false }
 faster-hex = { workspace = true, features = ["std"] }
 futures = "0.3"
 lru.workspace = true
@@ -42,6 +41,7 @@ tokio = { workspace = true, features = ["macros", "sync"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = { workspace = true, features = ["std"] }
 universal-time = { workspace = true, features = ["std"] }
+yawc = { version = "0.4", default-features = false }
 
 [dev-dependencies]
 base64 = { workspace = true, features = ["std"] }
