@@ -21,14 +21,14 @@ aws_lc_rs = ["yawc/rustls-aws-lc-rs"]
 ring = ["yawc/rustls-ring"]
 # Kept for compatibility: yawc always trusts the webpki roots, so this selects nothing.
 rustls-tls-webpki-roots = []
-local-relay = ["dep:nostr-memory", "tokio/net"]
+local-relay = ["dep:hyper", "dep:hyper-util", "dep:nostr-memory", "tokio/net"]
 
 [dependencies]
 async-utility.workspace = true
-# TODO: only the local relay's server side still needs this, drop it once that moves to yawc.
-async-wsocket = { version = "0.17", default-features = false }
 faster-hex = { workspace = true, features = ["std"] }
 futures = "0.3"
+hyper = { version = "1.9", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 lru.workspace = true
 negentropy = { workspace = true, features = ["std"] }
 nostr = { workspace = true, features = ["std", "rand", "os-rng"] }

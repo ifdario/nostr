@@ -12,8 +12,10 @@ use std::time::Duration;
 
 use async_utility::futures_util::stream::SplitSink;
 use async_utility::futures_util::{SinkExt, StreamExt};
-use async_wsocket::native;
-use async_wsocket::native::{Message, Role, WebSocketConfig, WebSocketStream};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use nostr::filter::{MatchEventOptions, SingleLetterTag};
 use nostr::message::MachineReadablePrefix;
@@ -21,7 +23,9 @@ use nostr::prelude::*;
 use nostr_memory::prelude::*;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, broadcast};
+use tokio::sync::{Notify, OnceCell, OwnedSemaphorePermit, Semaphore, broadcast, mpsc};
+use yawc::frame::{Frame, OpCode};
+use yawc::{Options, Role, WebSocket};
 
 use super::super::builder::{
     DEFAULT_MAX_PENDING_HANDSHAKES, LocalRelayBuilder, LocalRelayBuilderMode,
@@ -33,8 +37,9 @@ use super::util;
 use crate::client::{Client, ClientNotification, Output, RelayUrlArg, SyncSummary};
 use crate::error::{Error, ErrorKind};
 use crate::relay::SyncOptions;
+use crate::transport::websocket::Reporting;
 
-type WsTx<S> = SplitSink<WebSocketStream<S>, Message>;
+type WsTx<S> = SplitSink<Reporting<S>, Frame>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GiftWrapQueryAccess {
@@ -289,11 +294,11 @@ impl InnerLocalRelay {
             tokio::time::sleep(unresponsive_connection).await;
         }
 
-        let ws_stream =
-            WebSocketStream::from_raw_socket(stream, Role::Server, Some(self.websocket_config()))
-                .await;
+        let socket = WebSocket::from_stream(stream, Role::Server, self.websocket_options())
+            .map_err(Error::transport)?;
 
-        self.handle_websocket(ws_stream, addr, permit).await?;
+        self.handle_websocket(Reporting::new(socket), addr, permit)
+            .await?;
 
         Ok(())
     }
@@ -306,22 +311,53 @@ impl InnerLocalRelay {
         permit: OwnedSemaphorePermit,
     ) -> Result<(), Error>
     where
-        S: AsyncRead + AsyncWrite + Unpin,
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         if let Some(unresponsive_connection) = self.test.unresponsive_connection {
             tokio::time::sleep(unresponsive_connection).await;
         }
 
+        // The upgraded socket only exists once the response has been written, so the service
+        // hands it back over a channel instead of returning it.
+        let (upgraded_tx, mut upgraded_rx) = mpsc::channel(1);
+        let options: Options = self.websocket_options();
+
+        let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+            let upgraded_tx = upgraded_tx.clone();
+            let options: Options = options.clone();
+
+            async move {
+                let (response, upgrade) = WebSocket::upgrade_with_options(&mut request, options)?;
+
+                tokio::spawn(async move {
+                    match upgrade.await {
+                        Ok(socket) => {
+                            let _ = upgraded_tx.send(socket).await;
+                        }
+                        Err(e) => tracing::warn!("WebSocket upgrade failed: {e}"),
+                    }
+                });
+
+                Ok::<_, yawc::WebSocketError>(response)
+            }
+        });
+
         // Bound clients that open TCP but never complete the WebSocket handshake.
-        let ws_stream = tokio::time::timeout(
-            self.websocket_handshake_timeout,
-            native::accept_async_with_config(raw_stream, Some(self.websocket_config())),
-        )
+        let socket = tokio::time::timeout(self.websocket_handshake_timeout, async {
+            http1::Builder::new()
+                .serve_connection(TokioIo::new(raw_stream), service)
+                .with_upgrades()
+                .await
+                .map_err(Error::transport)?;
+
+            upgraded_rx.recv().await.ok_or_else(|| {
+                Error::with_static_message(ErrorKind::Transport, "WebSocket upgrade failed")
+            })
+        })
         .await
         .map_err(|_| {
             Error::with_static_message(ErrorKind::Transport, "WebSocket handshake timed out")
-        })?
-        .map_err(Error::transport)?;
+        })??;
 
         // The pre-handshake socket is no longer consuming admission resources.
         drop(permit);
@@ -329,7 +365,8 @@ impl InnerLocalRelay {
         // An established connection only consumes a permit when explicitly configured.
         let permit = self.connections_limit.clone().try_acquire_owned()?;
 
-        self.handle_websocket(ws_stream, addr, permit).await?;
+        self.handle_websocket(Reporting::new(socket), addr, permit)
+            .await?;
 
         Ok(())
     }
@@ -337,7 +374,7 @@ impl InnerLocalRelay {
     /// Handle websocket connection
     async fn handle_websocket<S>(
         &self,
-        ws_stream: WebSocketStream<S>,
+        ws_stream: Reporting<S>,
         addr: SocketAddr,
         _permit: OwnedSemaphorePermit,
     ) -> Result<(), Error>
@@ -374,11 +411,12 @@ impl InnerLocalRelay {
                                 return Err(Error::limit_exceeded("too many client messages"));
                             }
 
-                            match msg {
-                                Message::Text(json) => {
-                                    tracing::trace!("Received {json}");
-                                    let message_size = json.len();
-                                    match ClientMessage::from_json(json.as_bytes()) {
+                            match msg.opcode() {
+                                OpCode::Text => {
+                                    let payload = msg.payload();
+                                    tracing::trace!("Received {}", String::from_utf8_lossy(payload));
+                                    let message_size = payload.len();
+                                    match ClientMessage::from_json(payload.as_ref()) {
                                         Ok(msg) => {
                                             self.handle_client_msg(
                                                 &mut session,
@@ -401,17 +439,17 @@ impl InnerLocalRelay {
                                         }
                                     }
                                 }
-                                Message::Binary(..) => {
+                                OpCode::Binary => {
                                     let msg =
                                         RelayMessage::Notice(Cow::Borrowed("binary messages are not processed by this relay"));
                                     if let Err(e) = send_msg(&mut tx, msg).await {
                                         tracing::error!("Can't send msg to client: {e}");
                                     }
                                 }
-                                Message::Ping(..) => {}
-                                Message::Pong(..) => {}
-                                Message::Close(..) => {}
-                                Message::Frame(..) => {}
+                                OpCode::Continuation
+                                | OpCode::Ping
+                                | OpCode::Pong
+                                | OpCode::Close => {}
                             }
                         }
                         Some(Err(e)) => tracing::error!("Can't handle websocket msg: {e}"),
@@ -447,10 +485,13 @@ impl InnerLocalRelay {
         Ok(())
     }
 
-    fn websocket_config(&self) -> WebSocketConfig {
-        WebSocketConfig::default()
-            .max_message_size(Some(self.max_websocket_message_size))
-            .max_frame_size(Some(self.max_websocket_message_size))
+    fn websocket_options(&self) -> Options {
+        Options::default()
+            .with_limits(
+                self.max_websocket_message_size,
+                self.max_websocket_message_size,
+            )
+            .with_utf8()
     }
 
     async fn handle_client_msg<S>(
@@ -1480,7 +1521,7 @@ async fn send_msg<S>(tx: &mut WsTx<S>, msg: RelayMessage<'_>) -> Result<(), Erro
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    tx.send(Message::Text(msg.as_json().into()))
+    tx.send(Frame::text(msg.as_json()))
         .await
         .map_err(|e| Error::new(ErrorKind::Other, e))?;
     Ok(())
@@ -1720,7 +1761,7 @@ mod tests {
     #[test]
     fn local_relay_defaults_bound_connection_resources() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default());
-        let config = relay.websocket_config();
+        let options = relay.websocket_options();
 
         assert_eq!(relay.pending_handshakes_limit.available_permits(), 128);
         assert_eq!(
@@ -1734,8 +1775,8 @@ mod tests {
         assert_eq!(relay.max_filter_limit, 500);
         assert_eq!(relay.max_subscription_bytes, 1024 * 1024);
         assert_eq!(relay.max_negentropy_items, 50_000);
-        assert_eq!(config.max_message_size, Some(5 * 1024 * 1024));
-        assert_eq!(config.max_frame_size, Some(5 * 1024 * 1024));
+        assert_eq!(options.max_payload_read, Some(5 * 1024 * 1024));
+        assert_eq!(options.max_read_buffer, Some(5 * 1024 * 1024));
         assert_eq!(relay.websocket_handshake_timeout.as_secs(), 10);
     }
 
@@ -1747,12 +1788,12 @@ mod tests {
                 .max_websocket_message_size(1024)
                 .websocket_handshake_timeout(Duration::from_secs(2)),
         );
-        let config = relay.websocket_config();
+        let options = relay.websocket_options();
 
         assert_eq!(relay.pending_handshakes_limit.available_permits(), 128);
         assert_eq!(relay.connections_limit.available_permits(), 4);
-        assert_eq!(config.max_message_size, Some(1024));
-        assert_eq!(config.max_frame_size, Some(1024));
+        assert_eq!(options.max_payload_read, Some(1024));
+        assert_eq!(options.max_read_buffer, Some(1024));
         assert_eq!(relay.websocket_handshake_timeout.as_secs(), 2);
     }
 
@@ -1781,9 +1822,11 @@ mod tests {
         relay.database.save_event(&event).await.unwrap();
 
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -1799,12 +1842,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Ok {
                 status: false,
                 message,
@@ -1821,9 +1862,11 @@ mod tests {
                 .query_policy(ReplaceWithGiftWrap),
         );
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -1841,24 +1884,18 @@ mod tests {
             .await
             .unwrap();
 
-        let auth = client.next().await.unwrap().unwrap();
-        let closed = client.next().await.unwrap().unwrap();
+        let auth = client.next().await.unwrap();
+        let closed = client.next().await.unwrap();
+        assert_eq!(auth.opcode(), OpCode::Text);
         assert!(matches!(
-            auth,
-            Message::Text(json)
-                if matches!(
-                    RelayMessage::from_json(json.as_bytes()).unwrap(),
-                    RelayMessage::Auth { .. }
-                )
+            RelayMessage::from_json(auth.payload()).unwrap(),
+            RelayMessage::Auth { .. }
         ));
+        assert_eq!(closed.opcode(), OpCode::Text);
         assert!(matches!(
-            closed,
-            Message::Text(json)
-                if matches!(
-                    RelayMessage::from_json(json.as_bytes()).unwrap(),
-                    RelayMessage::Closed { message, .. }
-                        if message.starts_with("auth-required:")
-                )
+            RelayMessage::from_json(closed.payload()).unwrap(),
+            RelayMessage::Closed { message, .. }
+                if message.starts_with("auth-required:")
         ));
     }
 
@@ -1866,9 +1903,11 @@ mod tests {
     async fn oversized_active_subscription_is_rejected() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().max_subscription_bytes(10));
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -1886,12 +1925,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -1906,9 +1943,11 @@ mod tests {
     async fn excessive_req_filters_are_rejected() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().max_filters_per_req(1));
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -1926,12 +1965,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -1944,9 +1981,11 @@ mod tests {
     async fn zero_query_rate_rejects_query_starts() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().queries_per_minute(0));
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         session.query_tokens = Tokens::new(0);
         session.negentropy_tokens = Tokens::new(0);
@@ -1966,12 +2005,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -1993,12 +2030,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -2020,12 +2055,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -2048,12 +2081,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -2066,9 +2097,11 @@ mod tests {
     async fn negentropy_continuations_do_not_consume_query_start_allowance() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().queries_per_minute(1));
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
@@ -2086,12 +2119,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -2115,12 +2146,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -2143,12 +2172,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::EndOfStoredEvents(subscription_id)
                 if subscription_id.as_str() == "allowed"
         ));
@@ -2168,12 +2195,10 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
-        let Message::Text(response) = response else {
-            panic!("unexpected WebSocket message");
-        };
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(response.as_bytes()).unwrap(),
+            RelayMessage::from_json(response.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -2189,9 +2214,11 @@ mod tests {
             .finalize(&Keys::generate())
             .unwrap();
         let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server = WebSocketStream::from_raw_socket(server_stream, Role::Server, None).await;
-        let mut client = WebSocketStream::from_raw_socket(client_stream, Role::Client, None).await;
-        let (mut server_tx, _) = server.split();
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let mut client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (mut server_tx, _) = Reporting::new(server).split();
         let mut session = session(None);
         session.auth_tokens = Tokens::new(0);
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
@@ -2207,15 +2234,12 @@ mod tests {
             .await
             .unwrap();
 
-        let response = client.next().await.unwrap().unwrap();
+        let response = client.next().await.unwrap();
+        assert_eq!(response.opcode(), OpCode::Text);
         assert!(matches!(
-            response,
-            Message::Text(json)
-                if matches!(
-                    RelayMessage::from_json(json.as_bytes()).unwrap(),
-                    RelayMessage::Ok { status: false, message, .. }
-                        if message == "rate-limited: too many authentication attempts"
-                )
+            RelayMessage::from_json(response.payload()).unwrap(),
+            RelayMessage::Ok { status: false, message, .. }
+                if message == "rate-limited: too many authentication attempts"
         ));
     }
 

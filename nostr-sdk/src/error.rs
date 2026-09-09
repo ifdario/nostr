@@ -53,8 +53,6 @@ opaquerr::define_error! {
         nostr_gossip::error::Error => ErrorKind::Gossip,
         faster_hex::Error => ErrorKind::Protocol,
         negentropy::Error => ErrorKind::Protocol,
-        #[cfg(any(feature = "local-relay", test))]
-        async_wsocket::Error => ErrorKind::Other,
         yawc::WebSocketError => ErrorKind::Transport,
         tokio::sync::oneshot::error::RecvError => ErrorKind::Other,
         tokio::sync::broadcast::error::RecvError => ErrorKind::Other,

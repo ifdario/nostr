@@ -162,7 +162,7 @@ where
 /// broken connection indistinguishable from one the relay closed cleanly. Polling the frame
 /// directly keeps the two apart, at the cost of tracking the terminal state here.
 #[cfg(not(target_arch = "wasm32"))]
-struct Reporting<S> {
+pub(crate) struct Reporting<S> {
     socket: WebSocket<S>,
     /// Set once a read has failed, so the socket is not polled again afterwards.
     failed: bool,
@@ -170,7 +170,7 @@ struct Reporting<S> {
 
 #[cfg(not(target_arch = "wasm32"))]
 impl<S> Reporting<S> {
-    fn new(socket: WebSocket<S>) -> Self {
+    pub(crate) fn new(socket: WebSocket<S>) -> Self {
         Self {
             socket,
             failed: false,

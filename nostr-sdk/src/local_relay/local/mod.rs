@@ -158,14 +158,16 @@ mod tests {
     use std::pin::Pin;
     use std::time::Duration;
 
-    use async_wsocket::{ConnectionMode, Message, Url, WebSocket};
     use futures::{SinkExt, StreamExt};
     use negentropy::{Negentropy, NegentropyStorageVector};
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};
     use nostr::filter::Filter;
     use nostr::key::Keys;
     use nostr::message::{MachineReadablePrefix, RelayMessage};
+    use nostr::types::Url;
     use tokio::time;
+    use yawc::WebSocket;
+    use yawc::frame::{Frame, OpCode};
 
     use super::*;
     use crate::local_relay::{QueryPolicy, QueryPolicyResult};
@@ -216,18 +218,16 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         socket
-            .send(Message::Text(
-                r#"["REQ","short-author",{"authors":["deadbeef"]}]"#.to_owned(),
+            .send(Frame::text(
+                r#"["REQ","short-author",{"authors":["deadbeef"]}]"#,
             ))
             .await
             .unwrap();
         socket
-            .send(Message::Text(r#"["REQ","valid",{}]"#.to_owned()))
+            .send(Frame::text(r#"["REQ","valid",{}]"#))
             .await
             .unwrap();
 
@@ -238,11 +238,10 @@ mod tests {
                 let message = socket
                     .next()
                     .await
-                    .expect("WebSocket connection terminated")
-                    .unwrap();
+                    .expect("WebSocket connection terminated");
 
-                if let Message::Text(json) = message {
-                    match RelayMessage::from_json(json.as_bytes()).unwrap() {
+                if message.opcode() == OpCode::Text {
+                    match RelayMessage::from_json(message.payload()).unwrap() {
                         RelayMessage::Notice(..) => received_notice = true,
                         RelayMessage::EndOfStoredEvents(subscription_id)
                             if subscription_id.as_str() == "valid" =>
@@ -265,28 +264,22 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         socket
-            .send(Message::Text(
-                r#"["NEG-OPEN","neg-odd",{},"abc"]"#.to_owned(),
-            ))
+            .send(Frame::text(r#"["NEG-OPEN","neg-odd",{},"abc"]"#))
             .await
             .unwrap();
         socket
-            .send(Message::Text(
-                r#"["NEG-OPEN","neg-nonhex",{},"zz"]"#.to_owned(),
-            ))
+            .send(Frame::text(r#"["NEG-OPEN","neg-nonhex",{},"zz"]"#))
             .await
             .unwrap();
         socket
-            .send(Message::Text(r#"["NEG-MSG","neg-msg","abc"]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-MSG","neg-msg","abc"]"#))
             .await
             .unwrap();
         socket
-            .send(Message::Text(r#"["REQ","valid",{}]"#.to_owned()))
+            .send(Frame::text(r#"["REQ","valid",{}]"#))
             .await
             .unwrap();
 
@@ -297,11 +290,10 @@ mod tests {
                 let message = socket
                     .next()
                     .await
-                    .expect("WebSocket connection terminated")
-                    .unwrap();
+                    .expect("WebSocket connection terminated");
 
-                if let Message::Text(json) = message {
-                    match RelayMessage::from_json(json.as_bytes()).unwrap() {
+                if message.opcode() == OpCode::Text {
+                    match RelayMessage::from_json(message.payload()).unwrap() {
                         RelayMessage::NegErr { message, .. } => {
                             assert_eq!(message, "error: invalid negentropy message");
                             neg_errors += 1;
@@ -327,9 +319,7 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         // Open a valid negentropy subscription
         let mut storage = NegentropyStorageVector::new();
@@ -337,33 +327,29 @@ mod tests {
         let mut negentropy = Negentropy::owned(storage, 60_000).unwrap();
         let initial_message = faster_hex::hex_string(&negentropy.initiate().unwrap());
         socket
-            .send(Message::Text(format!(
+            .send(Frame::text(format!(
                 r#"["NEG-OPEN","neg",{{}},"{initial_message}"]"#
             )))
             .await
             .unwrap();
 
-        let reply = socket.next().await.unwrap().unwrap();
-        let Message::Text(reply) = reply else {
-            panic!("unexpected websocket message");
-        };
+        let reply = socket.next().await.unwrap();
+        assert_eq!(reply.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(reply.as_bytes()).unwrap(),
+            RelayMessage::from_json(reply.payload()).unwrap(),
             RelayMessage::NegMsg { .. }
         ));
 
         // A malformed payload must terminate only this negentropy subscription
         socket
-            .send(Message::Text(r#"["NEG-MSG","neg","zz"]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-MSG","neg","zz"]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -373,16 +359,14 @@ mod tests {
 
         // The subscription is gone, but the connection keeps serving requests
         socket
-            .send(Message::Text(r#"["NEG-MSG","neg","6100"]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-MSG","neg","6100"]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -391,16 +375,14 @@ mod tests {
         ));
 
         socket
-            .send(Message::Text(r#"["REQ","valid",{}]"#.to_owned()))
+            .send(Frame::text(r#"["REQ","valid",{}]"#))
             .await
             .unwrap();
 
-        let eose = socket.next().await.unwrap().unwrap();
-        let Message::Text(eose) = eose else {
-            panic!("unexpected websocket message");
-        };
+        let eose = socket.next().await.unwrap();
+        assert_eq!(eose.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(eose.as_bytes()).unwrap(),
+            RelayMessage::from_json(eose.payload()).unwrap(),
             RelayMessage::EndOfStoredEvents(subscription_id)
                 if subscription_id.as_str() == "valid"
         ));
@@ -414,29 +396,23 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["COUNT","count",{}]"#.to_owned()))
+            .send(Frame::text(r#"["COUNT","count",{}]"#))
             .await
             .unwrap();
 
-        let auth = socket.next().await.unwrap().unwrap();
-        let Message::Text(auth) = auth else {
-            panic!("unexpected websocket message");
-        };
+        let auth = socket.next().await.unwrap();
+        assert_eq!(auth.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(auth.as_bytes()).unwrap(),
+            RelayMessage::from_json(auth.payload()).unwrap(),
             RelayMessage::Auth { .. }
         ));
 
-        let closed = socket.next().await.unwrap().unwrap();
-        let Message::Text(closed) = closed else {
-            panic!("unexpected websocket message");
-        };
+        let closed = socket.next().await.unwrap();
+        assert_eq!(closed.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(closed.as_bytes()).unwrap(),
+            RelayMessage::from_json(closed.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -453,29 +429,23 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["NEG-OPEN","neg",{},""]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let auth = socket.next().await.unwrap().unwrap();
-        let Message::Text(auth) = auth else {
-            panic!("unexpected websocket message");
-        };
+        let auth = socket.next().await.unwrap();
+        assert_eq!(auth.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(auth.as_bytes()).unwrap(),
+            RelayMessage::from_json(auth.payload()).unwrap(),
             RelayMessage::Auth { .. }
         ));
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -490,20 +460,16 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["COUNT","count",{}]"#.to_owned()))
+            .send(Frame::text(r#"["COUNT","count",{}]"#))
             .await
             .unwrap();
 
-        let closed = socket.next().await.unwrap().unwrap();
-        let Message::Text(closed) = closed else {
-            panic!("unexpected websocket message");
-        };
+        let closed = socket.next().await.unwrap();
+        assert_eq!(closed.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(closed.as_bytes()).unwrap(),
+            RelayMessage::from_json(closed.payload()).unwrap(),
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -512,16 +478,14 @@ mod tests {
         ));
 
         socket
-            .send(Message::Text(r#"["NEG-OPEN","neg",{},""]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -538,20 +502,16 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["NEG-OPEN","neg",{},""]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -566,20 +526,16 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["NEG-OPEN","éé",{},""]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-OPEN","éé",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -605,20 +561,16 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
         socket
-            .send(Message::Text(r#"["NEG-OPEN","neg",{},""]"#.to_owned()))
+            .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap().unwrap();
-        let Message::Text(neg_err) = neg_err else {
-            panic!("unexpected websocket message");
-        };
+        let neg_err = socket.next().await.unwrap();
+        assert_eq!(neg_err.opcode(), OpCode::Text);
         assert!(matches!(
-            RelayMessage::from_json(neg_err.as_bytes()).unwrap(),
+            RelayMessage::from_json(neg_err.payload()).unwrap(),
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -633,31 +585,26 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         time::timeout(Duration::from_secs(5), async {
             for _ in 0..301 {
                 socket
-                    .send(Message::Text(r#"["CLOSE","harmless"]"#.to_owned()))
+                    .send(Frame::text(r#"["CLOSE","harmless"]"#))
                     .await
                     .unwrap();
             }
             socket
-                .send(Message::Text(r#"["REQ","valid",{}]"#.to_owned()))
+                .send(Frame::text(r#"["REQ","valid",{}]"#))
                 .await
                 .unwrap();
 
-            let eose = socket.next().await.unwrap().unwrap();
+            let eose = socket.next().await.unwrap();
+            assert_eq!(eose.opcode(), OpCode::Text);
             assert!(matches!(
-                eose,
-                Message::Text(json)
-                    if matches!(
-                        RelayMessage::from_json(json.as_bytes()).unwrap(),
-                        RelayMessage::EndOfStoredEvents(subscription_id)
-                            if subscription_id.as_str() == "valid"
-                    )
+                RelayMessage::from_json(eose.payload()).unwrap(),
+                RelayMessage::EndOfStoredEvents(subscription_id)
+                    if subscription_id.as_str() == "valid"
             ));
         })
         .await
@@ -670,23 +617,18 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         time::timeout(Duration::from_secs(5), async {
             for _ in 0..6_001 {
                 socket
-                    .send(Message::Text(r#"["CLOSE","harmless"]"#.to_owned()))
+                    .send(Frame::text(r#"["CLOSE","harmless"]"#))
                     .await
                     .unwrap();
             }
 
             let closed = socket.next().await;
-            assert!(matches!(
-                closed,
-                None | Some(Ok(Message::Close(..))) | Some(Err(..))
-            ));
+            assert!(closed.is_none_or(|frame| frame.opcode() == OpCode::Close));
         })
         .await
         .expect("connection did not close after 6,001 rapid frames");
@@ -698,30 +640,22 @@ mod tests {
         relay.run().await.unwrap();
 
         let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(&url, &ConnectionMode::direct())
-            .await
-            .unwrap();
+        let mut socket = WebSocket::connect(url).await.unwrap();
 
         time::timeout(Duration::from_secs(5), async {
             for byte in 1..=3 {
-                socket.send(Message::Binary(vec![byte])).await.unwrap();
-                let notice = socket.next().await.unwrap().unwrap();
+                socket.send(Frame::binary(vec![byte])).await.unwrap();
+                let notice = socket.next().await.unwrap();
+                assert_eq!(notice.opcode(), OpCode::Text);
                 assert!(matches!(
-                    notice,
-                    Message::Text(json)
-                        if matches!(
-                            RelayMessage::from_json(json.as_bytes()).unwrap(),
-                            RelayMessage::Notice(..)
-                        )
+                    RelayMessage::from_json(notice.payload()).unwrap(),
+                    RelayMessage::Notice(..)
                 ));
             }
 
-            socket.send(Message::Binary(vec![4])).await.unwrap();
+            socket.send(Frame::binary(vec![4])).await.unwrap();
             let closed = socket.next().await;
-            assert!(matches!(
-                closed,
-                None | Some(Ok(Message::Close(..))) | Some(Err(..))
-            ));
+            assert!(closed.is_none_or(|frame| frame.opcode() == OpCode::Close));
         })
         .await
         .expect("connection did not enforce the configured three-frame limit");
