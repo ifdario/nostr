@@ -98,7 +98,7 @@ impl WebSocketTransport for DefaultWebsocketTransport {
         Box::pin(async move {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let socket: TcpWebSocket = connect_native(url, proxy).await?;
+                let socket = connect_native(url, proxy).await?;
                 Ok(split(Reporting::new(socket)))
             }
 
@@ -106,7 +106,7 @@ impl WebSocketTransport for DefaultWebsocketTransport {
             {
                 // The browser dials on our behalf, so a proxy can't be applied here.
                 let _ = proxy;
-                let socket: WebSocket = WebSocket::connect(url.clone())
+                let socket = WebSocket::connect(url.clone())
                     .await
                     .map_err(Error::transport)?;
                 Ok(split(socket))
@@ -117,7 +117,7 @@ impl WebSocketTransport for DefaultWebsocketTransport {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn connect_native(url: &Url, proxy: Option<SocketAddr>) -> Result<TcpWebSocket, Error> {
-    let options: Options = Options::default()
+    let options = Options::default()
         .with_limits(MAX_PAYLOAD_READ, MAX_READ_BUFFER)
         .with_utf8();
 
@@ -130,7 +130,7 @@ async fn connect_native(url: &Url, proxy: Option<SocketAddr>) -> Result<TcpWebSo
     if let Some(proxy) = proxy {
         // `socks5h` leaves name resolution to the proxy, which is what makes `.onion`
         // addresses resolvable at all.
-        let url: Url = Url::parse(&format!("socks5h://{proxy}")).map_err(Error::transport)?;
+        let url = Url::parse(&format!("socks5h://{proxy}")).map_err(Error::transport)?;
         builder = builder.with_proxy(Proxy::socks5(url).map_err(Error::transport)?);
     }
 
@@ -150,8 +150,8 @@ where
 
     // NOTE: don't use sink_map_err here, as it may cause panics!
     // Issue: https://github.com/nostrdevkit/nostr/issues/984
-    let sink: WebSocketSink = Box::pin(TransportSink(tx)) as WebSocketSink;
-    let stream: WebSocketStream = Box::pin(rx.map_err(Error::transport)) as WebSocketStream;
+    let sink: WebSocketSink = Box::pin(TransportSink(tx));
+    let stream: WebSocketStream = Box::pin(rx.map_err(Error::transport));
 
     (sink, stream)
 }

@@ -298,9 +298,7 @@ impl InnerLocalRelay {
             .map_err(Error::transport)?;
 
         self.handle_websocket(Reporting::new(socket), addr, permit)
-            .await?;
-
-        Ok(())
+            .await
     }
 
     /// Pass bare [TcpStream] for handling
@@ -318,29 +316,20 @@ impl InnerLocalRelay {
         }
 
         // Take the connection permit before doing the handshake.
-        let connection_permit: OwnedSemaphorePermit =
-            self.connections_limit.clone().try_acquire_owned()?;
+        let connection_permit = self.connections_limit.clone().try_acquire_owned()?;
 
-        // The upgraded socket only exists once the response has been written, so the service
-        // hands it back over a channel instead of returning it.
-        let (upgraded_tx, mut upgraded_rx) = mpsc::channel(1);
-        let options: Options = self.websocket_options();
+        // The upgrade future only resolves once the response has been written, so the service
+        // hands it back over a channel instead of awaiting it.
+        let (upgrade_tx, mut upgrade_rx) = mpsc::channel(1);
+        let options = self.websocket_options();
 
         let service = service_fn(move |mut request: hyper::Request<Incoming>| {
-            let upgraded_tx = upgraded_tx.clone();
-            let options: Options = options.clone();
+            let upgrade_tx = upgrade_tx.clone();
+            let options = options.clone();
 
             async move {
                 let (response, upgrade) = WebSocket::upgrade_with_options(&mut request, options)?;
-
-                tokio::spawn(async move {
-                    match upgrade.await {
-                        Ok(socket) => {
-                            let _ = upgraded_tx.send(socket).await;
-                        }
-                        Err(e) => tracing::warn!("WebSocket upgrade failed: {e}"),
-                    }
-                });
+                let _ = upgrade_tx.send(upgrade).await;
 
                 Ok::<_, yawc::WebSocketError>(response)
             }
@@ -354,9 +343,14 @@ impl InnerLocalRelay {
                 .await
                 .map_err(Error::transport)?;
 
-            upgraded_rx.recv().await.ok_or_else(|| {
-                Error::with_static_message(ErrorKind::Transport, "WebSocket upgrade failed")
-            })
+            upgrade_rx
+                .recv()
+                .await
+                .ok_or_else(|| {
+                    Error::with_static_message(ErrorKind::Transport, "WebSocket upgrade failed")
+                })?
+                .await
+                .map_err(Error::transport)
         })
         .await
         .map_err(|_| {
@@ -367,9 +361,7 @@ impl InnerLocalRelay {
         drop(handshake_permit);
 
         self.handle_websocket(Reporting::new(socket), addr, connection_permit)
-            .await?;
-
-        Ok(())
+            .await
     }
 
     /// Handle websocket connection
@@ -1557,8 +1549,7 @@ where
 {
     tx.send(Frame::text(msg.as_json()))
         .await
-        .map_err(|e| Error::new(ErrorKind::Other, e))?;
-    Ok(())
+        .map_err(Error::other)
 }
 
 async fn send_query_rate_limit_error<S>(
