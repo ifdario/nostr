@@ -39,10 +39,17 @@
 - Take an `Into<Tag>` iterator instead of `Tag` iterator in
   `GiftWrapBuilder::extra_tags`, `PrivateDirectMessageBuilder::extra_tags`
   and `PrivateDirectMessageBuilder::rumor_extra_tags` (https://github.com/nostrdevkit/nostr/pull/1447)
+- nip47 BIP321 methods `pay` and `receive` (https://github.com/nostrdevkit/nostr/pull/1465)
 
 ### Security
 
 - Enforce max length for relay URLs in `RelayUrl::parse` (https://github.com/nostrdevkit/nostr/pull/1451)
+
+## v0.45.5 - 2026/09/11
+
+### Fixed 
+
+- Include LICENSE file
 
 ## v0.45.4 - 2026/08/30
 

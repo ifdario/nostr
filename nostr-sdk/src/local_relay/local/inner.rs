@@ -64,7 +64,7 @@ pub(super) struct InnerLocalRelay {
     auth_events_per_minute: u32,
     messages_per_minute: u32,
     pending_handshakes_limit: Arc<Semaphore>,
-    connections_limit: Arc<Semaphore>,
+    pub(crate) connections_limit: Arc<Semaphore>,
     max_websocket_message_size: usize,
     max_event_size: usize,
     websocket_handshake_timeout: Duration,
@@ -96,7 +96,7 @@ impl InnerLocalRelay {
         };
 
         // Channels
-        let (new_event, ..) = broadcast::channel(1024);
+        let (new_event, ..) = broadcast::channel(builder.new_event_channel_size.get());
 
         let database: Arc<dyn NostrDatabase> = builder.database.unwrap_or_else(|| {
             let max: NonZeroUsize = NonZeroUsize::new(75_000).unwrap();
@@ -308,7 +308,7 @@ impl InnerLocalRelay {
         self,
         raw_stream: S,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        handshake_permit: OwnedSemaphorePermit,
     ) -> Result<(), Error>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -316,6 +316,10 @@ impl InnerLocalRelay {
         if let Some(unresponsive_connection) = self.test.unresponsive_connection {
             tokio::time::sleep(unresponsive_connection).await;
         }
+
+        // Take the connection permit before doing the handshake.
+        let connection_permit: OwnedSemaphorePermit =
+            self.connections_limit.clone().try_acquire_owned()?;
 
         // The upgraded socket only exists once the response has been written, so the service
         // hands it back over a channel instead of returning it.
@@ -360,12 +364,9 @@ impl InnerLocalRelay {
         })??;
 
         // The pre-handshake socket is no longer consuming admission resources.
-        drop(permit);
+        drop(handshake_permit);
 
-        // An established connection only consumes a permit when explicitly configured.
-        let permit = self.connections_limit.clone().try_acquire_owned()?;
-
-        self.handle_websocket(Reporting::new(socket), addr, permit)
+        self.handle_websocket(Reporting::new(socket), addr, connection_permit)
             .await?;
 
         Ok(())
@@ -457,23 +458,51 @@ impl InnerLocalRelay {
                     }
                 }
                 event = new_event.recv() => {
-                    if let Ok(event) = event {
-                         // Iter subscriptions
-                        'sub_iter: for (subscription_id, subscription) in session.subscriptions.iter() {
-                            for filter in subscription.filters.iter() {
-                                // Check if event matches filter
-                                if filter.match_event(&event, MatchEventOptions::new()) {
-                                    send_msg(&mut tx, RelayMessage::Event{
-                                        subscription_id: Cow::Borrowed(subscription_id),
-                                        event: Cow::Borrowed(&event)
-                                    }).await?;
+                    let event: Event = match event {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            // Lost events cannot be matched against filters anymore. End all
+                            // live subscriptions rather than silently continue an incomplete stream.
+                            new_event = new_event.resubscribe();
 
-                                    // Found a match, stop iterating the filters and continue with the next subscription
-                                    continue 'sub_iter;
-                                }
+                            if !session.subscriptions.is_empty() {
+                                tracing::warn!(
+                                    peer = %addr,
+                                    skipped_notifications = skipped,
+                                    affected_subscriptions = session.subscriptions.len(),
+                                    "Closing live subscriptions after broadcast overflow"
+                                );
                             }
 
+                            session.subscription_bytes = 0;
+
+                            for (subscription_id, _) in session.subscriptions.drain() {
+                                send_msg(&mut tx, RelayMessage::Closed {
+                                    subscription_id: Cow::Owned(subscription_id),
+                                    message: Cow::Borrowed("error: live event buffer overflow; resubscribe to recover stored events"),
+                                }).await?;
+                            }
+
+                            continue;
                         }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+
+                    // Iter subscriptions
+                    'sub_iter: for (subscription_id, subscription) in session.subscriptions.iter() {
+                        for filter in subscription.filters.iter() {
+                            // Check if event matches filter
+                            if filter.match_event(&event, MatchEventOptions::new()) {
+                                send_msg(&mut tx, RelayMessage::Event{
+                                    subscription_id: Cow::Borrowed(subscription_id),
+                                    event: Cow::Borrowed(&event)
+                                }).await?;
+
+                                // Found a match, stop iterating the filters and continue with the next subscription
+                                continue 'sub_iter;
+                            }
+                        }
+
                     }
                 }
                 _ = self.shutdown.notified() => break,
@@ -958,7 +987,12 @@ impl InnerLocalRelay {
                     .await;
                 }
 
-                match session.nip42.check_challenge(&event, &self.url().await) {
+                let relay_url: RelayUrl =
+                    match self.nip42.as_ref().and_then(|opts| opts.relay_url.as_ref()) {
+                        Some(url) => url.clone(),
+                        None => self.url().await,
+                    };
+                match session.nip42.check_challenge(&event, &relay_url) {
                     Ok(()) => {
                         send_msg(
                             ws_tx,
@@ -1707,6 +1741,206 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Default)]
+    struct PausedCount {
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl QueryPolicy for PausedCount {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = QueryPolicyResult> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if query.limit == Some(42) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                QueryPolicyResult::Accept
+            })
+        }
+    }
+
+    async fn next_frame(socket: &mut WebSocket<tokio::io::DuplexStream>) -> String {
+        let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap();
+        String::from_utf8(frame.payload().to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn live_overflow_closes_subscriptions_and_allows_resubscription() {
+        check_live_backlog(1025, true).await;
+    }
+
+    #[tokio::test]
+    async fn live_backlog_at_capacity_preserves_subscriptions() {
+        check_live_backlog(1024, false).await;
+    }
+
+    async fn check_live_backlog(event_count: usize, expect_overflow: bool) {
+        let policy = Arc::new(PausedCount::default());
+        let mut relay =
+            InnerLocalRelay::new(LocalRelayBuilder::default().max_subscription_bytes(80));
+        relay.query_policy = Some(policy.clone());
+        let (client, server) = tokio::io::duplex(4096);
+        let inner = relay.clone();
+        let connection = tokio::spawn(async move {
+            inner
+                .handle_upgraded_connection(server, "127.0.0.1:1234".parse().unwrap())
+                .await
+        });
+        let mut client = WebSocket::from_stream(client, Role::Client, Options::default()).unwrap();
+        for id in ["first", "second"] {
+            client
+                .send(Frame::text(format!(r#"["REQ","{id}",{{"kinds":[1]}}]"#)))
+                .await
+                .unwrap();
+            assert_eq!(next_frame(&mut client).await, format!(r#"["EOSE","{id}"]"#));
+        }
+
+        // A second connection continues consuming the same broadcast normally.
+        let (healthy, server) = tokio::io::duplex(4096);
+        let inner = relay.clone();
+        let healthy_connection = tokio::spawn(async move {
+            inner
+                .handle_upgraded_connection(server, "127.0.0.1:1235".parse().unwrap())
+                .await
+        });
+        let mut healthy =
+            WebSocket::from_stream(healthy, Role::Client, Options::default()).unwrap();
+        healthy
+            .send(Frame::text(r#"["REQ","healthy",{"kinds":[1]}]"#))
+            .await
+            .unwrap();
+        assert_eq!(next_frame(&mut healthy).await, r#"["EOSE","healthy"]"#);
+
+        // Hold one session inside a query while filling its live broadcast buffer.
+        client
+            .send(Frame::text(r#"["COUNT","pause",{"kinds":[1],"limit":42}]"#))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), policy.entered.notified())
+            .await
+            .unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "during pause")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay.save_event(&event).await.unwrap();
+        for _ in 0..event_count {
+            assert!(relay.notify_event(event.clone()));
+            let frame = next_frame(&mut healthy).await;
+            assert!(matches!(
+                RelayMessage::from_json(frame).unwrap(),
+                RelayMessage::Event { .. }
+            ));
+        }
+        policy.release.notify_one();
+        assert_eq!(
+            next_frame(&mut client).await,
+            r#"["COUNT","pause",{"count":1}]"#
+        );
+
+        if expect_overflow {
+            let mut closed = HashSet::new();
+            for _ in 0..2 {
+                let frame = next_frame(&mut client).await;
+                match RelayMessage::from_json(frame).unwrap() {
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } => {
+                        assert_eq!(
+                            message,
+                            "error: live event buffer overflow; resubscribe to recover stored events"
+                        );
+                        closed.insert(subscription_id.to_string());
+                    }
+                    message => panic!("expected explicit gap notification, got {message:?}"),
+                }
+            }
+            assert_eq!(
+                closed,
+                HashSet::from(["first".to_owned(), "second".to_owned()])
+            );
+        } else {
+            let mut counts = HashMap::new();
+            for _ in 0..event_count * 2 {
+                let frame = next_frame(&mut client).await;
+                match RelayMessage::from_json(frame).unwrap() {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event: received,
+                    } => {
+                        assert_eq!(received.id, event.id);
+                        *counts.entry(subscription_id.to_string()).or_insert(0) += 1;
+                    }
+                    message => panic!("expected retained live event, got {message:?}"),
+                }
+            }
+            assert_eq!(
+                counts,
+                HashMap::from([
+                    ("first".to_owned(), event_count),
+                    ("second".to_owned(), event_count)
+                ])
+            );
+            for id in ["first", "second"] {
+                client
+                    .send(Frame::text(format!(r#"["CLOSE","{id}"]"#)))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Reusing the connection must not retain the old subscriptions' byte budget.
+        client
+            .send(Frame::text(r#"["REQ","recovered",{"kinds":[1]}]"#))
+            .await
+            .unwrap();
+        let frame = next_frame(&mut client).await;
+        match RelayMessage::from_json(frame).unwrap() {
+            RelayMessage::Event {
+                subscription_id,
+                event: received,
+            } => {
+                assert_eq!(subscription_id.as_str(), "recovered");
+                assert_eq!(received.id, event.id);
+            }
+            message => panic!("expected recovered stored event, got {message:?}"),
+        }
+        assert_eq!(next_frame(&mut client).await, r#"["EOSE","recovered"]"#);
+        let event = EventBuilder::new(Kind::TextNote, "after recovery")
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert!(relay.notify_event(event.clone()));
+        let frame = next_frame(&mut client).await;
+        match RelayMessage::from_json(frame).unwrap() {
+            RelayMessage::Event {
+                subscription_id,
+                event: received,
+            } => {
+                assert_eq!(subscription_id.as_str(), "recovered");
+                assert_eq!(received.id, event.id);
+            }
+            message => panic!("expected recovered live subscription, got {message:?}"),
+        }
+        let frame = next_frame(&mut healthy).await;
+        assert!(matches!(
+            RelayMessage::from_json(frame).unwrap(),
+            RelayMessage::Event { .. }
+        ));
+
+        connection.abort();
+        healthy_connection.abort();
+        let _ = connection.await;
+        let _ = healthy_connection.await;
+    }
 
     #[derive(Debug)]
     struct RejectWrites;

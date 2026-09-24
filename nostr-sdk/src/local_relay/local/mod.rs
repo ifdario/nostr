@@ -25,6 +25,11 @@ use crate::relay::SyncOptions;
 /// A local nostr relay
 ///
 /// This is automatically shutdown when all instances/clones are dropped!
+///
+/// If a session falls behind the bounded live event buffer, its active live
+/// subscriptions receive `CLOSED`. Clients can resubscribe to recover stored
+/// events; ephemeral events and events only passed to [`Self::notify_event`]
+/// cannot be recovered from the relay database.
 #[derive(Debug)]
 pub struct LocalRelay {
     inner: InnerLocalRelay,
@@ -93,6 +98,12 @@ impl LocalRelay {
     #[inline]
     pub async fn url(&self) -> RelayUrl {
         self.inner.url().await
+    }
+
+    /// Returns the remaining connection capacity before the limit is reached.
+    #[inline]
+    pub fn connections_left(&self) -> usize {
+        self.inner.connections_limit.available_permits()
     }
 
     /// Sync events with other relay(s).
