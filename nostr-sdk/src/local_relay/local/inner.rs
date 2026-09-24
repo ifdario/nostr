@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use async_utility::futures_util::stream::SplitSink;
 use async_utility::futures_util::{SinkExt, StreamExt};
+use hyper::Request;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -323,7 +324,7 @@ impl InnerLocalRelay {
         let (upgrade_tx, mut upgrade_rx) = mpsc::channel(1);
         let options = self.websocket_options();
 
-        let service = service_fn(move |mut request: hyper::Request<Incoming>| {
+        let service = service_fn(move |mut request: Request<Incoming>| {
             let upgrade_tx = upgrade_tx.clone();
             let options = options.clone();
 
@@ -409,7 +410,7 @@ impl InnerLocalRelay {
                                     let payload = msg.payload();
                                     tracing::trace!("Received {}", String::from_utf8_lossy(payload));
                                     let message_size = payload.len();
-                                    match ClientMessage::from_json(payload.as_ref()) {
+                                    match ClientMessage::from_json(payload) {
                                         Ok(msg) => {
                                             self.handle_client_msg(
                                                 &mut session,
@@ -1731,7 +1732,27 @@ where
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::DuplexStream;
+
     use super::*;
+
+    const TEST_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
+    struct TestWebSockets {
+        tx: WsTx<DuplexStream>,
+        client: WebSocket<DuplexStream>,
+    }
+
+    fn test_websockets() -> TestWebSockets {
+        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
+        let server =
+            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
+        let client =
+            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
+        let (tx, _) = Reporting::new(server).split();
+
+        TestWebSockets { tx, client }
+    }
 
     #[derive(Debug, Default)]
     struct PausedCount {
@@ -1756,7 +1777,7 @@ mod tests {
         }
     }
 
-    async fn next_frame(socket: &mut WebSocket<tokio::io::DuplexStream>) -> String {
+    async fn next_frame(socket: &mut WebSocket<DuplexStream>) -> String {
         let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
             .await
             .unwrap()
@@ -2046,22 +2067,16 @@ mod tests {
             .unwrap();
         relay.database.save_event(&event).await.unwrap();
 
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         let message_size = event.as_json().len() + 10;
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Event(Cow::Owned(event)),
-                &addr,
+                &TEST_ADDR,
                 message_size,
             )
             .await
@@ -2086,24 +2101,18 @@ mod tests {
                 .auth_dm(true)
                 .query_policy(ReplaceWithGiftWrap),
         );
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Count {
                     subscription_id: Cow::Owned(SubscriptionId::new("gift-wrap")),
                     filter: Cow::Owned(Filter::new().kind(Kind::TextNote)),
                 },
-                &addr,
+                &TEST_ADDR,
                 0,
             )
             .await
@@ -2127,24 +2136,18 @@ mod tests {
     #[tokio::test]
     async fn oversized_active_subscription_is_rejected() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().max_subscription_bytes(10));
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Req {
                     subscription_id: Cow::Owned(SubscriptionId::new("oversized")),
                     filters: vec![Cow::Owned(Filter::new())],
                 },
-                &addr,
+                &TEST_ADDR,
                 11,
             )
             .await
@@ -2167,24 +2170,18 @@ mod tests {
     #[tokio::test]
     async fn excessive_req_filters_are_rejected() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().max_filters_per_req(1));
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Req {
                     subscription_id: Cow::Owned(SubscriptionId::new("filters")),
                     filters: vec![Cow::Owned(Filter::new()), Cow::Owned(Filter::new())],
                 },
-                &addr,
+                &TEST_ADDR,
                 4,
             )
             .await
@@ -2205,26 +2202,20 @@ mod tests {
     #[tokio::test]
     async fn zero_query_rate_rejects_query_starts() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().queries_per_minute(0));
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
         session.query_tokens = Tokens::new(0);
         session.negentropy_tokens = Tokens::new(0);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Req {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited")),
                     filters: vec![Cow::Owned(Filter::new())],
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2244,12 +2235,12 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::NegMsg {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited-neg-msg")),
                     message: Cow::Borrowed("6100"),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2269,12 +2260,12 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Count {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited-count")),
                     filter: Cow::Owned(Filter::new()),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2294,13 +2285,13 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::NegOpen {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited-neg")),
                     filter: Cow::Owned(Filter::new()),
                     initial_message: Cow::Borrowed(""),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2321,24 +2312,18 @@ mod tests {
     #[tokio::test]
     async fn negentropy_continuations_do_not_consume_query_start_allowance() {
         let relay = InnerLocalRelay::new(LocalRelayBuilder::default().queries_per_minute(1));
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::NegMsg {
                     subscription_id: Cow::Owned(SubscriptionId::new("neg")),
                     message: Cow::Borrowed("6100"),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2360,12 +2345,12 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::NegMsg {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited-neg")),
                     message: Cow::Borrowed("6100"),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2386,12 +2371,12 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Req {
                     subscription_id: Cow::Owned(SubscriptionId::new("allowed")),
                     filters: vec![Cow::Owned(Filter::new())],
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2409,12 +2394,12 @@ mod tests {
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Count {
                     subscription_id: Cow::Owned(SubscriptionId::new("limited")),
                     filter: Cow::Owned(Filter::new()),
                 },
-                &addr,
+                &TEST_ADDR,
                 2,
             )
             .await
@@ -2438,22 +2423,16 @@ mod tests {
         let event = EventBuilder::new(Kind::TextNote, "not an auth event")
             .finalize(&Keys::generate())
             .unwrap();
-        let (server_stream, client_stream) = tokio::io::duplex(16 * 1024);
-        let server =
-            WebSocket::from_stream(server_stream, Role::Server, Options::default()).unwrap();
-        let mut client =
-            WebSocket::from_stream(client_stream, Role::Client, Options::default()).unwrap();
-        let (mut server_tx, _) = Reporting::new(server).split();
+        let TestWebSockets { mut tx, mut client } = test_websockets();
         let mut session = session(None);
         session.auth_tokens = Tokens::new(0);
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
 
         relay
             .handle_client_msg(
                 &mut session,
-                &mut server_tx,
+                &mut tx,
                 ClientMessage::Auth(Cow::Owned(event)),
-                &addr,
+                &TEST_ADDR,
                 0,
             )
             .await

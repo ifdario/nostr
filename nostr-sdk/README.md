@@ -101,15 +101,12 @@ More examples can be found in the [examples directory](./examples).
 
 The following crate feature flags are available:
 
-| Feature                   | Default | Description                                      |
-|---------------------------|:-------:|--------------------------------------------------|
-| `ring`                    |   Yes   | Enable `ring` crypto provider                    |
-| `rustls-tls-webpki-roots` |   Yes   | Enable rustls with bundled Mozilla root certs    |
-| `aws_lc_rs`               |   No    | Enable `aws-lc-rs` crypto provider               |
-| `native-tls`              |   No    | Enable platform-native TLS                       |
-| `native-tls-vendored`     |   No    | Enable platform-native TLS with vendored OpenSSL |
-| `rustls-tls-native-roots` |   No    | Enable rustls with platform-native root certs    |
-| `local-relay`             |   No    | Enable `nostr_sdk::local_relay` module           |
+| Feature                   | Default | Description                                         |
+|---------------------------|:-------:|-----------------------------------------------------|
+| `ring`                    |   Yes   | Enable the `ring` crypto provider                   |
+| `rustls-tls-webpki-roots` |   Yes   | Compatibility feature; webpki roots are always used |
+| `aws_lc_rs`               |   No    | Enable the `aws-lc-rs` crypto provider              |
+| `local-relay`             |   No    | Enable the `nostr_sdk::local_relay` module          |
 
 ## Local Relay supported NIPs
 

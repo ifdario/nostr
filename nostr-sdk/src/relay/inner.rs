@@ -884,7 +884,7 @@ impl InnerRelay {
                     tracing::debug!("Sending '{json}' to '{}' (size: {size} bytes)", self.url);
 
                     // Compose WebSocket text messages
-                    let msg: Frame = Frame::text(json);
+                    let msg = Frame::text(json);
 
                     // Send WebSocket messages
                     send_ws_msg(ws_tx, msg).await?;
@@ -945,18 +945,14 @@ impl InnerRelay {
         let _ping = ping;
 
         while let Some(frame) = ws_rx.next().await {
-            let frame: Frame = frame?;
+            let frame = frame?;
 
             match frame.opcode() {
-                // The transport asks yawc to validate UTF-8, so an invalid payload closes the
-                // connection before it reaches here. Handle it anyway rather than panicking on
-                // `Frame::as_str`.
-                OpCode::Text => match str::from_utf8(frame.payload()) {
-                    Ok(json) => self.handle_relay_message(json, &ingester_tx).await,
-                    Err(..) => {
-                        return Err(Error::protocol_msg("relay message is not valid UTF-8"));
-                    }
-                },
+                OpCode::Text => {
+                    let json = str::from_utf8(frame.payload())
+                        .map_err(|_| Error::protocol_msg("relay message is not valid UTF-8"))?;
+                    self.handle_relay_message(json, &ingester_tx).await;
+                }
                 OpCode::Binary => {
                     tracing::warn!(url = %self.url, "Binary messages aren't supported.");
                 }
@@ -966,28 +962,22 @@ impl InnerRelay {
                         return Err(Error::protocol_msg("can't parse pong"));
                     };
 
-                    // Nonce from big-endian bytes
-                    let nonce: u64 = u64::from_be_bytes(nonce);
+                    let nonce = u64::from_be_bytes(nonce);
+                    let last_nonce = ping.last_nonce();
 
-                    // Get last nonce
-                    let last_nonce: u64 = ping.last_nonce();
-
-                    // Check if last nonce not matches the received one
                     if last_nonce != nonce {
                         return Err(Error::pong_not_match(last_nonce, nonce));
                     }
 
-                    // Set ping as replied
                     ping.set_replied(true);
 
-                    // Save latency
                     let sent_at = ping.sent_at().await;
                     self.stats.save_latency(sent_at.elapsed());
                 }
                 #[cfg(not(target_arch = "wasm32"))]
                 OpCode::Close => {
                     if let Some(code) = frame.close_code() {
-                        let reason: &str = frame.close_reason().ok().flatten().unwrap_or_default();
+                        let reason = frame.close_reason().ok().flatten().unwrap_or("");
                         tracing::info!(?code, reason, "Connection closed by peer.");
                     }
                     break;

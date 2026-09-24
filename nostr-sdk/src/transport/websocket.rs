@@ -10,7 +10,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures::stream::SplitSink;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt};
 use nostr::types::Url;
 #[cfg(target_arch = "wasm32")]
@@ -18,7 +17,7 @@ use yawc::WebSocket;
 use yawc::WebSocketError;
 use yawc::frame::Frame;
 #[cfg(not(target_arch = "wasm32"))]
-use yawc::{HttpRequest, Options, Proxy, TcpWebSocket, WebSocket};
+use yawc::{HttpRequest, Options, Proxy, WebSocket};
 
 use crate::error::Error;
 use crate::future::BoxedFuture;
@@ -98,46 +97,34 @@ impl WebSocketTransport for DefaultWebsocketTransport {
         Box::pin(async move {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                let socket = connect_native(url, proxy).await?;
-                Ok(split(Reporting::new(socket)))
+                let mut connection = WebSocket::connect(url.clone())
+                    .with_options(
+                        Options::default()
+                            .with_limits(MAX_PAYLOAD_READ, MAX_READ_BUFFER)
+                            .with_utf8(),
+                    )
+                    .with_request(HttpRequest::builder().header("user-agent", USER_AGENT));
+
+                if let Some(proxy) = proxy {
+                    // Resolve names at the proxy so `.onion` addresses work.
+                    let url =
+                        Url::parse(&format!("socks5h://{proxy}")).map_err(Error::transport)?;
+                    connection = connection.with_proxy(Proxy::socks5(url)?);
+                }
+
+                Ok(split(Reporting::new(connection.await?)))
             }
 
             #[cfg(target_arch = "wasm32")]
             {
                 // The browser dials on our behalf, so a proxy can't be applied here.
                 let _ = proxy;
-                let socket = WebSocket::connect(url.clone())
-                    .await
-                    .map_err(Error::transport)?;
-                Ok(split(socket))
+                Ok(split(WebSocket::connect(url.clone()).await?))
             }
         })
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-async fn connect_native(url: &Url, proxy: Option<SocketAddr>) -> Result<TcpWebSocket, Error> {
-    let options = Options::default()
-        .with_limits(MAX_PAYLOAD_READ, MAX_READ_BUFFER)
-        .with_utf8();
-
-    let request = HttpRequest::builder().header("user-agent", USER_AGENT);
-
-    let mut builder = WebSocket::connect(url.clone())
-        .with_options(options)
-        .with_request(request);
-
-    if let Some(proxy) = proxy {
-        // `socks5h` leaves name resolution to the proxy, which is what makes `.onion`
-        // addresses resolvable at all.
-        let url = Url::parse(&format!("socks5h://{proxy}")).map_err(Error::transport)?;
-        builder = builder.with_proxy(Proxy::socks5(url).map_err(Error::transport)?);
-    }
-
-    builder.await.map_err(Error::transport)
-}
-
-/// Split a socket into the boxed sink and stream halves the transport hands back.
 fn split<T>(socket: T) -> (WebSocketSink, WebSocketStream)
 where
     T: Sink<Frame, Error = WebSocketError>
@@ -150,21 +137,16 @@ where
 
     // NOTE: don't use sink_map_err here, as it may cause panics!
     // Issue: https://github.com/nostrdevkit/nostr/issues/984
-    let sink: WebSocketSink = Box::pin(TransportSink(tx));
-    let stream: WebSocketStream = Box::pin(rx.map_err(Error::transport));
-
-    (sink, stream)
+    (
+        Box::pin(TransportSink(tx)),
+        Box::pin(rx.map_err(Error::transport)),
+    )
 }
 
-/// A socket that reports the read errors yawc's own [`Stream`] impl hides.
-///
-/// `impl Stream for WebSocket` maps a failure to the end of the stream, which would make a
-/// broken connection indistinguishable from one the relay closed cleanly. Polling the frame
-/// directly keeps the two apart, at the cost of tracking the terminal state here.
+/// Reports read errors that yawc's [`Stream`] implementation hides.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) struct Reporting<S> {
     socket: WebSocket<S>,
-    /// Set once a read has failed, so the socket is not polled again afterwards.
     failed: bool,
 }
 
@@ -192,13 +174,9 @@ where
             return Poll::Ready(None);
         }
 
-        match futures::ready!(this.socket.poll_next_frame(cx)) {
-            Ok(frame) => Poll::Ready(Some(Ok(frame))),
-            Err(e) => {
-                this.failed = true;
-                Poll::Ready(Some(Err(e)))
-            }
-        }
+        let result = futures::ready!(this.socket.poll_next_frame(cx));
+        this.failed = result.is_err();
+        Poll::Ready(Some(result))
     }
 }
 
@@ -210,54 +188,44 @@ where
     type Error = WebSocketError;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.socket).poll_ready(cx)
+        self.socket.poll_ready_unpin(cx)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Frame) -> Result<(), Self::Error> {
-        Pin::new(&mut self.socket).start_send(item)
+        self.socket.start_send_unpin(item)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.socket).poll_flush(cx)
+        self.socket.poll_flush_unpin(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.socket).poll_close(cx)
+        self.socket.poll_close_unpin(cx)
     }
 }
 
-struct TransportSink<T>(SplitSink<T, Frame>)
-where
-    T: Sink<Frame, Error = WebSocketError>;
+struct TransportSink<S>(S);
 
-impl<T> Sink<Frame> for TransportSink<T>
+impl<S> Sink<Frame> for TransportSink<S>
 where
-    T: Sink<Frame, Error = WebSocketError> + Unpin,
+    S: Sink<Frame, Error = WebSocketError> + Unpin,
 {
     type Error = Error;
 
     fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.0)
-            .poll_ready_unpin(cx)
-            .map_err(Error::transport)
+        self.0.poll_ready_unpin(cx).map_err(Error::from)
     }
 
     fn start_send(mut self: Pin<&mut Self>, item: Frame) -> Result<(), Self::Error> {
-        Pin::new(&mut self.0)
-            .start_send_unpin(item)
-            .map_err(Error::transport)
+        self.0.start_send_unpin(item).map_err(Error::from)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.0)
-            .poll_flush_unpin(cx)
-            .map_err(Error::transport)
+        self.0.poll_flush_unpin(cx).map_err(Error::from)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Pin::new(&mut self.0)
-            .poll_close_unpin(cx)
-            .map_err(Error::transport)
+        self.0.poll_close_unpin(cx).map_err(Error::from)
     }
 }
 
@@ -289,30 +257,6 @@ mod tests {
 
         String::from_utf8(request[..len].to_vec())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-    }
-
-    #[tokio::test]
-    async fn default_transport_sends_user_agent() -> Result<(), Box<dyn StdError>> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await?;
-            read_request(&mut stream).await
-        });
-
-        let url = Url::parse(&format!("ws://{address}"))?;
-        assert!(DefaultWebsocketTransport.connect(&url, None).await.is_err());
-
-        let request = server.await??;
-        let user_agent = request.lines().find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("user-agent")
-                .then(|| value.trim())
-        });
-        assert_eq!(user_agent, Some(USER_AGENT));
-
-        Ok(())
     }
 
     /// Serve one SOCKS5 CONNECT, then read whatever the client tunnels through it.
@@ -351,7 +295,7 @@ mod tests {
 
         let domain =
             String::from_utf8(domain).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let target: String = format!("{domain}:{}", u16::from_be_bytes(port));
+        let target = format!("{domain}:{}", u16::from_be_bytes(port));
 
         // Success, with a bound address of 0.0.0.0:0.
         stream
@@ -381,6 +325,11 @@ mod tests {
         let (target, request) = server.await??;
         assert_eq!(target, "relay.invalid:8080");
         assert!(request.starts_with("GET / HTTP/1.1"), "{request}");
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&format!("user-agent: {USER_AGENT}")))
+        );
 
         Ok(())
     }

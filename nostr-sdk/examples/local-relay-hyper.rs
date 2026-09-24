@@ -25,9 +25,7 @@ struct HttpServer {
 
 /// Derive the `Sec-WebSocket-Accept` response header from a `Sec-WebSocket-Key` request header.
 ///
-/// This example completes the handshake itself so it can hand the upgraded stream to
-/// [`LocalRelay::take_connection`], which is the entry point for servers that already
-/// speak HTTP.
+/// Complete the handshake before passing the upgraded stream to [`LocalRelay::take_connection`].
 pub fn derive_accept_key(request_key: &[u8]) -> String {
     // ... field is constructed by concatenating /key/ ...
     // ... with the string "258EAFA5-E914-47DA-95CA-C5AB0DC85B11" (RFC 6455)

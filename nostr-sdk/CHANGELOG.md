@@ -31,22 +31,19 @@
 
 ### Breaking changes
 
-- Replace `async-wsocket` with `yawc` as the WebSocket implementation. The transport
-  sink and stream now carry `yawc::frame::Frame` instead of `async_wsocket::Message`,
-  so custom `WebSocketTransport` implementations build frames with `Frame::text` and
-  match incoming ones on `Frame::opcode`
+- Replace `async-wsocket` with `yawc`. Custom `WebSocketTransport` sinks and streams
+  now use `yawc::frame::Frame` instead of `async_wsocket::Message`; use `Frame::text`
+  to build frames and `Frame::opcode` to match them
 - Remove the `native-tls`, `native-tls-vendored` and `rustls-tls-native-roots`
-  features, which have no equivalent in `yawc`. `ring` and `aws_lc_rs` now select
-  yawc's rustls backends, and `rustls-tls-webpki-roots` is kept as a no-op because
-  yawc always trusts the webpki roots. The same features are removed from `nwc` and
-  `nostr-connect`
+  features from `nostr-sdk`, `nwc` and `nostr-connect`. `ring` and `aws_lc_rs` now
+  select yawc's rustls backends; `rustls-tls-webpki-roots` remains a no-op because
+  yawc always trusts the webpki roots
 
 ### Changed
 
-- Route proxied relay connections through `socks5h`, leaving name resolution to the
-  proxy so `.onion` addresses stay reachable
-- Serve the local relay's listener over hyper, which is how yawc reaches its server
-  side. `LocalRelay::take_connection` is unchanged
+- Use `socks5h` for proxied relay connections so the proxy resolves names, including
+  `.onion` addresses
+- Serve the local relay listener with hyper. `LocalRelay::take_connection` is unchanged
 
 ### Added
 

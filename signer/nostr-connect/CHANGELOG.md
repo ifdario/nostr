@@ -31,8 +31,7 @@
 
 ### Breaking changes
 
-- Remove the `native-tls`, `native-tls-vendored` and `rustls-tls-native-roots` features,
-  following their removal from `nostr-sdk`
+- Remove the `native-tls`, `native-tls-vendored` and `rustls-tls-native-roots` features
 
 ## v0.45.2 - 2026/09/11
 

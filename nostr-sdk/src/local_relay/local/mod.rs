@@ -177,11 +177,26 @@ mod tests {
     use nostr::message::{MachineReadablePrefix, RelayMessage};
     use nostr::types::Url;
     use tokio::time;
-    use yawc::WebSocket;
     use yawc::frame::{Frame, OpCode};
+    use yawc::{TcpWebSocket, WebSocket};
 
     use super::*;
     use crate::local_relay::{QueryPolicy, QueryPolicyResult};
+
+    async fn connect(relay: &LocalRelay) -> TcpWebSocket {
+        relay.run().await.unwrap();
+        let url = Url::parse(relay.url().await.as_str()).unwrap();
+        WebSocket::connect(url).await.unwrap()
+    }
+
+    async fn next_relay_message(socket: &mut TcpWebSocket) -> RelayMessage<'static> {
+        let frame = socket
+            .next()
+            .await
+            .expect("WebSocket connection terminated");
+        assert_eq!(frame.opcode(), OpCode::Text);
+        RelayMessage::from_json(frame.payload()).unwrap()
+    }
 
     #[derive(Debug)]
     struct RejectQueries;
@@ -226,10 +241,8 @@ mod tests {
     #[tokio::test]
     async fn test_malformed_client_message_does_not_close_connection() {
         let relay = LocalRelay::new();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         socket
             .send(Frame::text(
@@ -246,22 +259,15 @@ mod tests {
             let mut received_notice = false;
 
             loop {
-                let message = socket
-                    .next()
-                    .await
-                    .expect("WebSocket connection terminated");
-
-                if message.opcode() == OpCode::Text {
-                    match RelayMessage::from_json(message.payload()).unwrap() {
-                        RelayMessage::Notice(..) => received_notice = true,
-                        RelayMessage::EndOfStoredEvents(subscription_id)
-                            if subscription_id.as_str() == "valid" =>
-                        {
-                            assert!(received_notice);
-                            break;
-                        }
-                        _ => {}
+                match next_relay_message(&mut socket).await {
+                    RelayMessage::Notice(..) => received_notice = true,
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_str() == "valid" =>
+                    {
+                        assert!(received_notice);
+                        break;
                     }
+                    _ => {}
                 }
             }
         })
@@ -272,10 +278,8 @@ mod tests {
     #[tokio::test]
     async fn test_malformed_negentropy_messages_do_not_close_connection() {
         let relay = LocalRelay::new();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         socket
             .send(Frame::text(r#"["NEG-OPEN","neg-odd",{},"abc"]"#))
@@ -298,25 +302,18 @@ mod tests {
             let mut neg_errors: usize = 0;
 
             loop {
-                let message = socket
-                    .next()
-                    .await
-                    .expect("WebSocket connection terminated");
-
-                if message.opcode() == OpCode::Text {
-                    match RelayMessage::from_json(message.payload()).unwrap() {
-                        RelayMessage::NegErr { message, .. } => {
-                            assert_eq!(message, "error: invalid negentropy message");
-                            neg_errors += 1;
-                        }
-                        RelayMessage::EndOfStoredEvents(subscription_id)
-                            if subscription_id.as_str() == "valid" =>
-                        {
-                            assert_eq!(neg_errors, 3);
-                            break;
-                        }
-                        _ => {}
+                match next_relay_message(&mut socket).await {
+                    RelayMessage::NegErr { message, .. } => {
+                        assert_eq!(message, "error: invalid negentropy message");
+                        neg_errors += 1;
                     }
+                    RelayMessage::EndOfStoredEvents(subscription_id)
+                        if subscription_id.as_str() == "valid" =>
+                    {
+                        assert_eq!(neg_errors, 3);
+                        break;
+                    }
+                    _ => {}
                 }
             }
         })
@@ -327,10 +324,8 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_neg_msg_terminates_only_the_negentropy_subscription() {
         let relay = LocalRelay::new();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         // Open a valid negentropy subscription
         let mut storage = NegentropyStorageVector::new();
@@ -344,12 +339,8 @@ mod tests {
             .await
             .unwrap();
 
-        let reply = socket.next().await.unwrap();
-        assert_eq!(reply.opcode(), OpCode::Text);
-        assert!(matches!(
-            RelayMessage::from_json(reply.payload()).unwrap(),
-            RelayMessage::NegMsg { .. }
-        ));
+        let reply = next_relay_message(&mut socket).await;
+        assert!(matches!(reply, RelayMessage::NegMsg { .. }));
 
         // A malformed payload must terminate only this negentropy subscription
         socket
@@ -357,10 +348,9 @@ mod tests {
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -374,10 +364,9 @@ mod tests {
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -390,10 +379,9 @@ mod tests {
             .await
             .unwrap();
 
-        let eose = socket.next().await.unwrap();
-        assert_eq!(eose.opcode(), OpCode::Text);
+        let eose = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(eose.payload()).unwrap(),
+            eose,
             RelayMessage::EndOfStoredEvents(subscription_id)
                 if subscription_id.as_str() == "valid"
         ));
@@ -404,26 +392,19 @@ mod tests {
         let relay = LocalRelay::builder()
             .nip42(crate::local_relay::LocalRelayBuilderNip42::read())
             .build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["COUNT","count",{}]"#))
             .await
             .unwrap();
 
-        let auth = socket.next().await.unwrap();
-        assert_eq!(auth.opcode(), OpCode::Text);
-        assert!(matches!(
-            RelayMessage::from_json(auth.payload()).unwrap(),
-            RelayMessage::Auth { .. }
-        ));
+        let auth = next_relay_message(&mut socket).await;
+        assert!(matches!(auth, RelayMessage::Auth { .. }));
 
-        let closed = socket.next().await.unwrap();
-        assert_eq!(closed.opcode(), OpCode::Text);
+        let closed = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(closed.payload()).unwrap(),
+            closed,
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -437,26 +418,19 @@ mod tests {
         let relay = LocalRelay::builder()
             .nip42(crate::local_relay::LocalRelayBuilderNip42::read())
             .build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let auth = socket.next().await.unwrap();
-        assert_eq!(auth.opcode(), OpCode::Text);
-        assert!(matches!(
-            RelayMessage::from_json(auth.payload()).unwrap(),
-            RelayMessage::Auth { .. }
-        ));
+        let auth = next_relay_message(&mut socket).await;
+        assert!(matches!(auth, RelayMessage::Auth { .. }));
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -468,19 +442,16 @@ mod tests {
     #[tokio::test]
     async fn test_query_policy_is_applied_to_count_and_negentropy() {
         let relay = LocalRelay::builder().query_policy(RejectQueries).build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["COUNT","count",{}]"#))
             .await
             .unwrap();
 
-        let closed = socket.next().await.unwrap();
-        assert_eq!(closed.opcode(), OpCode::Text);
+        let closed = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(closed.payload()).unwrap(),
+            closed,
             RelayMessage::Closed {
                 subscription_id,
                 message,
@@ -493,10 +464,9 @@ mod tests {
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -510,19 +480,16 @@ mod tests {
         let relay = LocalRelay::builder()
             .max_negentropy_subscriptions(0)
             .build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -534,19 +501,16 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_id_limit_counts_utf8_bytes() {
         let relay = LocalRelay::builder().max_subid_length(3).build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["NEG-OPEN","éé",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -569,19 +533,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
         socket
             .send(Frame::text(r#"["NEG-OPEN","neg",{},""]"#))
             .await
             .unwrap();
 
-        let neg_err = socket.next().await.unwrap();
-        assert_eq!(neg_err.opcode(), OpCode::Text);
+        let neg_err = next_relay_message(&mut socket).await;
         assert!(matches!(
-            RelayMessage::from_json(neg_err.payload()).unwrap(),
+            neg_err,
             RelayMessage::NegErr {
                 subscription_id,
                 message,
@@ -593,10 +554,8 @@ mod tests {
     #[tokio::test]
     async fn test_default_message_limit_allows_301_protocol_frames() {
         let relay = LocalRelay::new();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         time::timeout(Duration::from_secs(5), async {
             for _ in 0..301 {
@@ -610,10 +569,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let eose = socket.next().await.unwrap();
-            assert_eq!(eose.opcode(), OpCode::Text);
+            let eose = next_relay_message(&mut socket).await;
             assert!(matches!(
-                RelayMessage::from_json(eose.payload()).unwrap(),
+                eose,
                 RelayMessage::EndOfStoredEvents(subscription_id)
                     if subscription_id.as_str() == "valid"
             ));
@@ -625,10 +583,8 @@ mod tests {
     #[tokio::test]
     async fn test_default_message_limit_closes_rapid_burst_over_6000_frames() {
         let relay = LocalRelay::new();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         time::timeout(Duration::from_secs(5), async {
             for _ in 0..6_001 {
@@ -648,20 +604,14 @@ mod tests {
     #[tokio::test]
     async fn test_configured_message_limit_is_exact_for_binary_frames() {
         let relay = LocalRelay::builder().messages_per_minute(3).build();
-        relay.run().await.unwrap();
 
-        let url = Url::parse(relay.url().await.as_str()).unwrap();
-        let mut socket = WebSocket::connect(url).await.unwrap();
+        let mut socket = connect(&relay).await;
 
         time::timeout(Duration::from_secs(5), async {
             for byte in 1..=3 {
                 socket.send(Frame::binary(vec![byte])).await.unwrap();
-                let notice = socket.next().await.unwrap();
-                assert_eq!(notice.opcode(), OpCode::Text);
-                assert!(matches!(
-                    RelayMessage::from_json(notice.payload()).unwrap(),
-                    RelayMessage::Notice(..)
-                ));
+                let notice = next_relay_message(&mut socket).await;
+                assert!(matches!(notice, RelayMessage::Notice(..)));
             }
 
             socket.send(Frame::binary(vec![4])).await.unwrap();

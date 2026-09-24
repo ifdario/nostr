@@ -7,6 +7,7 @@
 use std::error;
 
 use nostr::types::RelayUrl;
+use yawc::WebSocketError;
 
 opaquerr::define_kind! {
     /// SDK error kind.
@@ -53,7 +54,7 @@ opaquerr::define_error! {
         nostr_gossip::error::Error => ErrorKind::Gossip,
         faster_hex::Error => ErrorKind::Protocol,
         negentropy::Error => ErrorKind::Protocol,
-        yawc::WebSocketError => ErrorKind::Transport,
+        WebSocketError => ErrorKind::Transport,
         tokio::sync::oneshot::error::RecvError => ErrorKind::Other,
         tokio::sync::broadcast::error::RecvError => ErrorKind::Other,
         #[cfg(any(feature = "local-relay", test))]
