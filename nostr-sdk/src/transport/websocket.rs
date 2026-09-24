@@ -263,13 +263,16 @@ where
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::error::Error as StdError;
+    use std::io;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     use super::*;
 
     /// Read the HTTP request a client wrote, up to the blank line that ends its head.
-    async fn read_request<S>(stream: &mut S) -> String
+    async fn read_request<S>(stream: &mut S) -> io::Result<String>
     where
         S: tokio::io::AsyncRead + Unpin,
     {
@@ -277,58 +280,61 @@ mod tests {
         let mut len = 0;
 
         while len < request.len() && !request[..len].ends_with(b"\r\n\r\n") {
-            let read = stream.read(&mut request[len..]).await.unwrap();
+            let read = stream.read(&mut request[len..]).await?;
             if read == 0 {
                 break;
             }
             len += read;
         }
 
-        String::from_utf8(request[..len].to_vec()).unwrap()
+        String::from_utf8(request[..len].to_vec())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     #[tokio::test]
-    async fn default_transport_sends_user_agent() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
+    async fn default_transport_sends_user_agent() -> Result<(), Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
 
         let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = listener.accept().await?;
             read_request(&mut stream).await
         });
 
-        let url = Url::parse(&format!("ws://{address}")).unwrap();
+        let url = Url::parse(&format!("ws://{address}"))?;
         assert!(DefaultWebsocketTransport.connect(&url, None).await.is_err());
 
-        let request = server.await.unwrap();
+        let request = server.await??;
         let user_agent = request.lines().find_map(|line| {
             let (name, value) = line.split_once(':')?;
             name.eq_ignore_ascii_case("user-agent")
                 .then(|| value.trim())
         });
         assert_eq!(user_agent, Some(USER_AGENT));
+
+        Ok(())
     }
 
     /// Serve one SOCKS5 CONNECT, then read whatever the client tunnels through it.
     ///
     /// Nothing answers the WebSocket handshake, so the client's connect fails. What the test
     /// cares about is the address the proxy was asked to reach and the bytes that followed.
-    async fn socks5_connect(listener: TcpListener) -> (String, String) {
-        let (mut stream, _) = listener.accept().await.unwrap();
+    async fn socks5_connect(listener: TcpListener) -> io::Result<(String, String)> {
+        let (mut stream, _) = listener.accept().await?;
 
         // Greeting: version, then the authentication methods the client offers.
         let mut greeting = [0u8; 2];
-        stream.read_exact(&mut greeting).await.unwrap();
+        stream.read_exact(&mut greeting).await?;
         assert_eq!(greeting[0], 0x05);
         let mut methods = vec![0u8; greeting[1] as usize];
-        stream.read_exact(&mut methods).await.unwrap();
+        stream.read_exact(&mut methods).await?;
 
         // "No authentication required"
-        stream.write_all(&[0x05, 0x00]).await.unwrap();
+        stream.write_all(&[0x05, 0x00]).await?;
 
         // Request: version, command, reserved, address type.
         let mut request = [0u8; 4];
-        stream.read_exact(&mut request).await.unwrap();
+        stream.read_exact(&mut request).await?;
         assert_eq!(request[0], 0x05);
         assert_eq!(request[1], 0x01, "expected a CONNECT command");
         assert_eq!(
@@ -337,37 +343,34 @@ mod tests {
         );
 
         let mut length = [0u8; 1];
-        stream.read_exact(&mut length).await.unwrap();
+        stream.read_exact(&mut length).await?;
         let mut domain = vec![0u8; length[0] as usize];
-        stream.read_exact(&mut domain).await.unwrap();
+        stream.read_exact(&mut domain).await?;
         let mut port = [0u8; 2];
-        stream.read_exact(&mut port).await.unwrap();
+        stream.read_exact(&mut port).await?;
 
-        let target: String = format!(
-            "{}:{}",
-            String::from_utf8(domain).unwrap(),
-            u16::from_be_bytes(port)
-        );
+        let domain =
+            String::from_utf8(domain).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let target: String = format!("{domain}:{}", u16::from_be_bytes(port));
 
         // Success, with a bound address of 0.0.0.0:0.
         stream
             .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-            .await
-            .unwrap();
+            .await?;
 
-        (target, read_request(&mut stream).await)
+        Ok((target, read_request(&mut stream).await?))
     }
 
     #[tokio::test]
-    async fn default_transport_dials_through_socks5_proxy() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = listener.local_addr().unwrap();
+    async fn default_transport_dials_through_socks5_proxy() -> Result<(), Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let proxy = listener.local_addr()?;
 
         let server = tokio::spawn(socks5_connect(listener));
 
         // A name that never resolves locally, so reaching it proves the proxy resolved it.
         // This is what makes `.onion` addresses work.
-        let url = Url::parse("ws://relay.invalid:8080").unwrap();
+        let url = Url::parse("ws://relay.invalid:8080")?;
         assert!(
             DefaultWebsocketTransport
                 .connect(&url, Some(proxy))
@@ -375,8 +378,10 @@ mod tests {
                 .is_err()
         );
 
-        let (target, request) = server.await.unwrap();
+        let (target, request) = server.await??;
         assert_eq!(target, "relay.invalid:8080");
         assert!(request.starts_with("GET / HTTP/1.1"), "{request}");
+
+        Ok(())
     }
 }
